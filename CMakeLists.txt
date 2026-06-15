@@ -12,7 +12,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # 开启 O3 极限优化 和 本地 CPU AVX/SSE 指令集加速
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -DNDEBUG")
+#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -DNDEBUG")
 
 # 寻找并链接 OpenMP (让 Eigen 自动多线程并行计算矩阵)
 find_package(OpenMP)

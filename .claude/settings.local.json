@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls *)",
+      "Bash(find \"\\\\\\\\wsl.localhost\\\\Ubuntu-24.04\\\\home\\\\ty\\\\SonarTracker715\\\\src\" -type f)",
+      "Bash(find \"\\\\\\\\wsl.localhost\\\\Ubuntu-24.04\\\\home\\\\ty\\\\SonarTracker715\\\\3rdparty\" -type f)",
+      "Bash(find \"\\\\\\\\wsl.localhost\\\\Ubuntu-24.04\\\\home\\\\ty\\\\SonarTracker715\\\\data\" -type f)",
+      "Bash(find \"\\\\\\\\wsl.localhost\\\\Ubuntu-24.04\\\\home\\\\ty\\\\SonarTracker715\\\\lib\" -type f)",
+      "Bash(cat \"\\\\\\\\wsl.localhost\\\\Ubuntu-24.04\\\\home\\\\ty\\\\SonarTracker715\\\\.gitignore\")",
+      "Bash(cat \"\\\\\\\\wsl.localhost\\\\Ubuntu-24.04\\\\home\\\\ty\\\\SonarTracker715\\\\python_TXT.txt\")",
+      "Bash(cat \"\\\\\\\\wsl.localhost\\\\Ubuntu-24.04\\\\home\\\\ty\\\\SonarTracker715\\\\gemini_TXT.txt\")",
+      "Bash(cat \"\\\\\\\\wsl.localhost\\\\Ubuntu-24.04\\\\home\\\\ty\\\\SonarTracker715\\\\github_wsl.txt\")",
+      "Bash(cat \"\\\\\\\\wsl.localhost\\\\Ubuntu-24.04\\\\home\\\\ty\\\\SonarTracker715\\\\delete_Identifier.txt\")"
+    ]
+  }
+}
