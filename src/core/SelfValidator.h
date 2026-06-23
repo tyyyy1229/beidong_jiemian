@@ -20,6 +20,7 @@ public:
     const std::vector<TargetTruth>& getTruthData() const { return m_truthData; }
 
     void setDepthResolveEnabled(bool enabled) { m_enableDepthResolve = enabled; }
+    void setScreeningGateDeg(double gateDeg);
 
 public slots:
     void onBatchFinished(int batchIndex, int startFrame, int endFrame, const std::vector<BatchTargetFeature>& dspFeatures);
@@ -28,6 +29,8 @@ signals:
     void validationLogReady(const QString& logStr);
     void batchAccuracyComputed(int batchIndex, double accuracy);
     void mfpResultReady(const QList<TargetEvaluation>& mfpResults); // 【新增】将完美判决发给 UI
+    void batchFeatureIdentifyRateComputed(int batchIndex, double rate, int matchedCount, int truthCount, int falseAlarmCount);
+    void autonomousScreeningAccuracyComputed(int batchIndex, double rate, int totalGroupCount);
 
 private:
     std::vector<TargetTruth> m_truthData;
@@ -35,6 +38,7 @@ private:
     double evaluateMatch(const BatchTargetFeature& feature, const TargetTruth& truth);
 
     bool m_enableDepthResolve = false;
+    double m_screeningGateDeg = 6.0;
 
     void loadReplicaFields(const QString& rawPath);
     double estimateDepthMFP(double true_depth, double true_range_km, const std::vector<double>& freqs);

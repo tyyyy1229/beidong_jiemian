@@ -72,6 +72,8 @@ struct BatchTargetFeature {
     int formalId;
     double calAngle;
     std::vector<double> calLofar;
+    std::vector<int> calLofarCounts;     // 每个线谱簇在批处理有效帧中的出现次数
+    int activeFrames = 0;                // 该目标参与批处理的有效帧数
     std::vector<double> calLofarDcv;
     double calDemon;
 };
@@ -158,6 +160,7 @@ struct TargetEvaluation {
     double trueDepth = -1.0;
     QString trueClass = "未知";
     bool isMfpCorrect = false;
+    QString trueLofarFreqsStr;
 
     int mfpCorrectCount = 0;
     int mfpTotalCount = 0;

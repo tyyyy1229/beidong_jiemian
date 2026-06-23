@@ -74,6 +74,8 @@ private slots:
     void onTargetNameChanged(QTableWidgetItem* item); // 【意见三】监听目标改名
     void onDepthResolveToggled(bool checked);
     void onMfpResultReady(const QList<TargetEvaluation>& mfpResults); // 【新增】
+    void onBatchFeatureIdentifyRateComputed(int batchIndex, double rate, int matchedCount, int truthCount, int falseAlarmCount);
+    void onAutonomousScreeningAccuracyComputed(int batchIndex, double rate, int totalGroupCount);
 
     void onUdpConfigClicked(); // 【新增】打开配置面板的槽函数
 private:
@@ -89,9 +91,10 @@ private:
     void closePopupsFromLayout(QLayout* targetLayout);
     void createTargetPlots(int targetId);
     void updateTab2Plots();
+    void updateSliceHeaders();  // 根据左右区算法选择动态更新切片列标题
     void fixAllPlotTitles();
 
-    QWidget* createCardWidget(QLabel* contentLabel, const QString& bgColor, const QString& title);
+    QWidget* createCardWidget(QLabel* contentLabel, const QString& bgColor, const QString& title, int titleFontSize = 14);
 
     DspWorker* m_worker;
     SelfValidator* m_validator;
@@ -176,8 +179,13 @@ private:
     QWidget* m_targetPanelWidget;
     QGridLayout* m_targetLayout;
 
-    QCustomPlot* m_cbfWaterfallPlot;
-    QCustomPlot* m_dcvWaterfallPlot;
+    // 左右独立可配置瀑布图绘图区
+    QCustomPlot* m_leftWaterfallPlot;
+    QCustomPlot* m_rightWaterfallPlot;
+    QComboBox* m_cmbLeftAlgo;       // 左区算法选择 (0=CBF, 1=DCV)
+    QComboBox* m_cmbRightAlgo;      // 右区算法选择
+    QComboBox* m_cmbLeftColor;      // 左区绘图风格 (0=Jet..4=Polar)
+    QComboBox* m_cmbRightColor;     // 右区绘图风格
     QWidget* m_sliceWidget;
     QGridLayout* m_sliceLayout;
 
@@ -192,6 +200,19 @@ private:
     QCustomPlot* m_plotTargetAccuracy;
     QCustomPlot* m_plotBatchAccuracy;
     QCPBars* m_accuracyBars;
+
+    // 【新增】互扰特征鉴别正确率
+    QLabel* m_lblFeatureIdentifyRate = nullptr;
+    QVector<double> m_batchFeatureIdentifyRates;
+    QVector<int> m_batchFeatureIdentifyIndexes;
+    QCustomPlot* m_plotFeatureIdentifyRate = nullptr;
+
+    // 【新增】自主筛选正确率
+    QLabel* m_lblAutonomousScreeningRate = nullptr;
+    QVector<int> m_autonomousScreeningIndexes;
+    QVector<double> m_autonomousScreeningRates;
+    QCustomPlot* m_plotAutonomousScreeningRate = nullptr;
+    double m_latestAutonomousScreeningRate = 100.0;
 
     QLineEdit* m_editDeleteTargetId;
     QPushButton* m_btnDeleteTarget;

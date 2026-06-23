@@ -29,8 +29,18 @@
 #include <QDoubleSpinBox>
 
 namespace {
+
+static QString stripLineSpectrumCounts(const QString& src)
+{
+    QString out = src;
+    out.remove(QRegularExpression("\\([^\\)]*\\)"));
+    out.replace(" ,", ",");
+    out.replace(", ", ", ");
+    return out.trimmed();
+}
+
 // 【核心黑科技】：图表外骨骼包装器
-QWidget* wrapPlotWithRangeControl(QCustomPlot* plot, const QString& labelText, double minVal, double maxVal, double defaultMin, double defaultMax) {
+QWidget* wrapPlotWithRangeControl(QCustomPlot* plot, const QString& labelText, double minVal, double maxVal, double defaultMin, double defaultMax, QComboBox** outColorCombo = nullptr) {
     QWidget* wrapper = new QWidget(plot->parentWidget());
     wrapper->setObjectName(plot->objectName() + "_wrapper");
 
@@ -38,6 +48,7 @@ QWidget* wrapPlotWithRangeControl(QCustomPlot* plot, const QString& labelText, d
     layout->setContentsMargins(0, 0, 0, 0); layout->setSpacing(2);
 
     QWidget* ctrlBar = new QWidget(wrapper);
+    ctrlBar->setObjectName("rangeCtrlBar");
     ctrlBar->setStyleSheet("background-color: #1e1e1e; border-radius: 3px; border: 1px solid #333;");
     ctrlBar->setFixedHeight(26);
     QHBoxLayout* ctrlLayout = new QHBoxLayout(ctrlBar);
@@ -72,6 +83,20 @@ QWidget* wrapPlotWithRangeControl(QCustomPlot* plot, const QString& labelText, d
     ctrlLayout->addWidget(lbl); ctrlLayout->addWidget(spinMin);
     ctrlLayout->addWidget(new QLabel("-", ctrlBar)); ctrlLayout->addWidget(spinMax);
     ctrlLayout->addStretch();
+
+    // 【新增】可选的颜色风格下拉框，嵌入控制条右侧
+    if (outColorCombo) {
+        QComboBox* cmbColor = new QComboBox(ctrlBar);
+        cmbColor->addItems({"Jet", "Hot", "Thermal", "Grayscale", "Polar"});
+        cmbColor->setCurrentIndex(0);
+        cmbColor->setStyleSheet(
+            "QComboBox { background-color: #121212; color: #aaa; border: 1px solid #555;"
+            " font-size: 10px; padding: 1px 3px; max-width: 80px; }"
+            "QComboBox QAbstractItemView { background-color: #1a1a1a; color: #ddd;"
+            " selection-background-color: #333; }");
+        ctrlLayout->addWidget(cmbColor);
+        *outColorCombo = cmbColor;
+    }
 
     layout->addWidget(ctrlBar);
     plot->setParent(wrapper);
@@ -627,6 +652,8 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent),
     // 绑定 SelfValidator 的批次结果输出信号 到 主界面
     connect(m_validator, &SelfValidator::validationLogReady, this, &MainWindow::appendReport, Qt::QueuedConnection);
     connect(m_validator, &SelfValidator::batchAccuracyComputed, this, &MainWindow::onBatchAccuracyComputed, Qt::QueuedConnection);
+    connect(m_validator, &SelfValidator::batchFeatureIdentifyRateComputed, this, &MainWindow::onBatchFeatureIdentifyRateComputed, Qt::QueuedConnection);
+    connect(m_validator, &SelfValidator::autonomousScreeningAccuracyComputed, this, &MainWindow::onAutonomousScreeningAccuracyComputed, Qt::QueuedConnection);
 
     // 绑定 DspWorker 的实时特征评估表 到 主界面 (用于刷新表一)
     connect(m_worker, &DspWorker::evaluationResultReady, this, &MainWindow::onEvaluationResultReady, Qt::QueuedConnection);
@@ -907,7 +934,7 @@ void MainWindow::onPlotDoubleClick(QMouseEvent *event) {
 
     // 【体验优化】：针对包含固定物理边界和滚动时间轴的特殊图表，采用智能自适应复原
     if (plot == m_spatialPlot || plot == m_timeAzimuthPlot ||
-            plot == m_cbfWaterfallPlot || plot == m_dcvWaterfallPlot) {
+            plot == m_leftWaterfallPlot || plot == m_rightWaterfallPlot) {
 
         plot->xAxis->setRange(0, 180); // X轴始终恢复到标准的 0~180 度全景
 
@@ -1230,6 +1257,10 @@ void MainWindow::onStartClicked() {
 
     m_historyResults.clear();
     m_batchAccuracies.clear();
+    m_batchFeatureIdentifyRates.clear();
+    m_batchFeatureIdentifyIndexes.clear();
+    m_autonomousScreeningIndexes.clear();
+    m_autonomousScreeningRates.clear();
     m_targetClasses.clear();
 
     for (auto* light : m_targetLights.values()) {
@@ -1252,8 +1283,8 @@ void MainWindow::onStartClicked() {
     }
     m_lsPlots.clear(); m_lofarPlots.clear(); m_demonPlots.clear();
 
-    if (m_cbfWaterfallPlot) { m_cbfWaterfallPlot->clearPlottables(); m_cbfWaterfallPlot->replot(); }
-    if (m_dcvWaterfallPlot) { m_dcvWaterfallPlot->clearPlottables(); m_dcvWaterfallPlot->replot(); }
+    if (m_leftWaterfallPlot) { m_leftWaterfallPlot->clearPlottables(); m_leftWaterfallPlot->replot(); }
+    if (m_rightWaterfallPlot) { m_rightWaterfallPlot->clearPlottables(); m_rightWaterfallPlot->replot(); }
 
     closePopupsFromLayout(m_sliceLayout);
     if (m_sliceLayout) {
@@ -1275,6 +1306,7 @@ void MainWindow::onStartClicked() {
     const std::vector<TargetTruth>& truths = m_validator->getTruthData();
     m_worker->setGroundTruths(truths);
     m_validator->setDepthResolveEnabled(m_currentConfig.enableDepthResolve);
+    m_validator->setScreeningGateDeg(m_currentConfig.trackAssocGate);
 
     if (truths.empty()) {
         m_lblModeIndicator->setText("🔴 实战盲测模式 (无先验真值)");
@@ -1284,6 +1316,8 @@ void MainWindow::onStartClicked() {
         // 【新增】：盲测模式下直接隐藏这两个没有意义的真值图表
         m_plotTrueAzimuth->setVisible(false);
         m_plotBatchAccuracy->setVisible(false);
+        if (m_plotFeatureIdentifyRate) m_plotFeatureIdentifyRate->setVisible(false);
+        if (m_plotAutonomousScreeningRate) m_plotAutonomousScreeningRate->setVisible(false);
     } else {
         m_lblModeIndicator->setText(QString("🟢 算法仿真评估模式 (真值:%1个)").arg(truths.size()));
         m_lblModeIndicator->setStyleSheet("background-color: #eafaf1; color: #27ae60; font-size: 14px; font-weight: bold; border: 1px solid #27ae60; border-radius: 5px; padding: 6px;");
@@ -1292,6 +1326,8 @@ void MainWindow::onStartClicked() {
         // 【新增】：仿真模式下恢复显示
         m_plotTrueAzimuth->setVisible(true);
         m_plotBatchAccuracy->setVisible(true);
+        if (m_plotFeatureIdentifyRate) m_plotFeatureIdentifyRate->setVisible(true);
+        if (m_plotAutonomousScreeningRate) m_plotAutonomousScreeningRate->setVisible(true);
     }
 
     // =======================================================
@@ -1619,10 +1655,10 @@ void MainWindow::setupUi() {
                 for (QCustomPlot* p : m_demonPlots.values()) updateHeight(p, 200);
 
                 // 将 Tab 2 顶部的两大瀑布图也纳入自适应挤压管理！
-                updateHeight(m_cbfWaterfallPlot, 550);
-                updateHeight(m_dcvWaterfallPlot, 550);
+                updateHeight(m_leftWaterfallPlot, 550);
+                updateHeight(m_rightWaterfallPlot, 550);
                 // 【核心修复】：在全显模式下，强制 Splitter 给上方热力图分配绝大部分空间
-                if (QSplitter* split2 = m_cbfWaterfallPlot->nativeParentWidget()->findChild<QSplitter*>()) {
+                if (QSplitter* split2 = m_leftWaterfallPlot->nativeParentWidget()->findChild<QSplitter*>()) {
                     split2->setStretchFactor(0, isAutoFit ? 10 : 1); // 0是上方热力图列，权重拉满
                 }
 
@@ -1950,66 +1986,90 @@ void MainWindow::setupUi() {
 
         QSplitter* waterfallsSplitter = new QSplitter(Qt::Horizontal, tab2Container);
 
-        // 构建左侧 CBF
-        QWidget* cbfColWidget = new QWidget(waterfallsSplitter);
-        QVBoxLayout* cbfColLayout = new QVBoxLayout(cbfColWidget);
-        cbfColLayout->setContentsMargins(0, 0, 0, 0);
+        // ===== 辅助 lambda：构建一个独立可配置绘图区 =====
+        auto buildArea = [this](QWidget* parent, const QString& plotObjName,
+                                const QString& algoObjName,
+                                int defaultAlgo,  // 0=CBF, 1=DCV
+                                QCustomPlot** outPlot, QComboBox** outAlgoCmb,
+                                QComboBox** outColorCmb) -> QWidget* {
+            QWidget* area = new QWidget(parent);
+            QVBoxLayout* areaLayout = new QVBoxLayout(area);
+            areaLayout->setContentsMargins(0, 0, 0, 0);
 
-        QComboBox* cmbCbfColor = new QComboBox(cbfColWidget);
-            cmbCbfColor->setObjectName("cmbColorTab2_CBF");
-            // 【意见一修改】：精简文本，与 Tab 3 保持一致
-            cmbCbfColor->addItems({"🌈 CBF 风格: Jet", "🔥 CBF 风格: Hot", "🌌 CBF 风格: Thermal", "⚫ CBF 风格: Grayscale", "❄️ CBF 风格: Polar"});
-            // 【意见二修改】：将 CBF 下拉框的颜色改为与底部切片标题一致的亮青色 (#00cec9)
-            cmbCbfColor->setStyleSheet("QComboBox { background-color: #1a1a1a; color: #00cec9; border: 1px solid #00cec9; font-weight: bold; border-radius: 4px; padding: 4px; }");
-            cbfColLayout->addWidget(cmbCbfColor);
+            // --- 算法选择下拉框 ---
+            QComboBox* cmbAlgo = new QComboBox(area);
+            cmbAlgo->setObjectName(algoObjName);
+            cmbAlgo->addItems({
+                QString::fromUtf8("\xF0\x9F\x8C\x8A") + " 绘图算法：CBF（常规波束）",
+                QString::fromUtf8("\xF0\x9F\x8E\xAF") + " 绘图算法：DCV（高分辨反卷积）"
+            });
+            cmbAlgo->setCurrentIndex(defaultAlgo);
+            QColor accent = (defaultAlgo == 0) ? QColor("#00cec9") : QColor("#ff7675");
+            cmbAlgo->setStyleSheet(QString(
+                "QComboBox { background-color: #1a1a1a; color: %1; border: 1px solid %2;"
+                " font-weight: bold; border-radius: 4px; padding: 4px; }"
+                "QComboBox QAbstractItemView { background-color: #1a1a1a; color: #ddd;"
+                " selection-background-color: #333; border: 1px solid #555; }")
+                .arg(accent.name()).arg(accent.darker(140).name()));
+            areaLayout->addWidget(cmbAlgo);
+            *outAlgoCmb = cmbAlgo;
 
-        m_cbfWaterfallPlot = new QCustomPlot(cbfColWidget);
-        m_cbfWaterfallPlot->setObjectName("cbfWaterfallPlot");
-        m_cbfWaterfallPlot->setMinimumSize(0, 550); // 【关键修改】：打破 300 宽度的物理限制
-        setupPlotInteraction(m_cbfWaterfallPlot);
-        m_cbfWaterfallPlot->plotLayout()->insertRow(0); m_cbfWaterfallPlot->plotLayout()->addElement(0, 0, new QCPTextElement(m_cbfWaterfallPlot, "常规波束形成(CBF) 空间谱历程", QFont("sans", 12, QFont::Bold)));
-        cbfColLayout->addWidget(wrapPlotWithRangeControl(m_cbfWaterfallPlot, "聚焦方位角(°):", 0, 360, 0, 180));
+            // --- 瀑布图 + 范围控制条（含绘图风格下拉框）---
+            QCustomPlot* wfPlot = new QCustomPlot(area);
+            wfPlot->setObjectName(plotObjName);
+            wfPlot->setMinimumSize(0, 550);
+            setupPlotInteraction(wfPlot);
+            wfPlot->plotLayout()->insertRow(0);
+            wfPlot->plotLayout()->addElement(0, 0,
+                new QCPTextElement(wfPlot, "", QFont("sans", 12, QFont::Bold)));
+            *outPlot = wfPlot;
 
-        connect(cmbCbfColor, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index){
-            QCPColorGradient grad = QCPColorGradient::gpJet;
-            if(index==1) grad = QCPColorGradient::gpHot; else if(index==2) grad = QCPColorGradient::gpThermal; else if(index==3) grad = QCPColorGradient::gpGrayscale; else if(index==4) grad = QCPColorGradient::gpPolar;
-            if (m_cbfWaterfallPlot && m_cbfWaterfallPlot->plottableCount() > 0) {
-                qobject_cast<QCPColorMap*>(m_cbfWaterfallPlot->plottable(0))->setGradient(grad);
-                m_cbfWaterfallPlot->replot();
+            QWidget* wfWrapper = wrapPlotWithRangeControl(wfPlot, "聚焦方位角(°):",
+                0, 360, 0, 180, outColorCmb);
+            areaLayout->addWidget(wfWrapper);
+
+            // --- 算法切换：更新标题颜色 + 重绘 ---
+            QObject::connect(cmbAlgo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                wfPlot, [this, wfPlot, cmbAlgo](int idx) {
+                    QColor newAccent = (idx == 0) ? QColor("#00cec9") : QColor("#ff7675");
+                    cmbAlgo->setStyleSheet(QString(
+                        "QComboBox { background-color: #1a1a1a; color: %1; border: 1px solid %2;"
+                        " font-weight: bold; border-radius: 4px; padding: 4px; }"
+                        "QComboBox QAbstractItemView { background-color: #1a1a1a; color: #ddd;"
+                        " selection-background-color: #333; border: 1px solid #555; }")
+                        .arg(newAccent.name()).arg(newAccent.darker(140).name()));
+                    updateTab2Plots();
+                });
+
+            // --- 绘图风格切换：即时更新色阶 ---
+            if (*outColorCmb) {
+                QObject::connect(*outColorCmb, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                    wfPlot, [wfPlot](int index) {
+                        QCPColorGradient grad = QCPColorGradient::gpJet;
+                        if (index == 1) grad = QCPColorGradient::gpHot;
+                        else if (index == 2) grad = QCPColorGradient::gpThermal;
+                        else if (index == 3) grad = QCPColorGradient::gpGrayscale;
+                        else if (index == 4) grad = QCPColorGradient::gpPolar;
+                        if (wfPlot && wfPlot->plottableCount() > 0) {
+                            qobject_cast<QCPColorMap*>(wfPlot->plottable(0))->setGradient(grad);
+                            wfPlot->replot();
+                        }
+                    });
             }
-        });
 
-        // 构建右侧 DCV
-        QWidget* dcvColWidget = new QWidget(waterfallsSplitter);
-        QVBoxLayout* dcvColLayout = new QVBoxLayout(dcvColWidget);
-        dcvColLayout->setContentsMargins(0, 0, 0, 0);
+            return area;
+        };
 
-        QComboBox* cmbDcvColor = new QComboBox(dcvColWidget);
-            cmbDcvColor->setObjectName("cmbColorTab2_DCV");
-            // 【意见一修改】：精简文本
-            cmbDcvColor->addItems({"🌈 DCV 风格: Jet", "🔥 DCV 风格: Hot", "🌌 DCV 风格: Thermal", "⚫ DCV 风格: Grayscale", "❄️ DCV 风格: Polar"});
-            // 【意见二修改】：DCV 保持红色系，稍微提亮边框 (#e74c3c) 以匹配底部切片标题
-            cmbDcvColor->setStyleSheet("QComboBox { background-color: #1a1a1a; color: #ff7675; border: 1px solid #d63031; font-weight: bold; border-radius: 4px; padding: 4px; }");
-            dcvColLayout->addWidget(cmbDcvColor);
+        // 构建左区（默认 CBF）和右区（默认 DCV）
+        QWidget* leftAreaW = buildArea(waterfallsSplitter,
+            "leftWaterfallPlot",  "cmbLeftAlgo",  0,  // 0=CBF
+            &m_leftWaterfallPlot, &m_cmbLeftAlgo, &m_cmbLeftColor);
+        QWidget* rightAreaW = buildArea(waterfallsSplitter,
+            "rightWaterfallPlot", "cmbRightAlgo", 1,  // 1=DCV
+            &m_rightWaterfallPlot, &m_cmbRightAlgo, &m_cmbRightColor);
 
-        m_dcvWaterfallPlot = new QCustomPlot(dcvColWidget);
-        m_dcvWaterfallPlot->setObjectName("dcvWaterfallPlot");
-        m_dcvWaterfallPlot->setMinimumSize(0, 550); // 【关键修改】：打破 300 宽度的物理限制
-        setupPlotInteraction(m_dcvWaterfallPlot);
-        m_dcvWaterfallPlot->plotLayout()->insertRow(0); m_dcvWaterfallPlot->plotLayout()->addElement(0, 0, new QCPTextElement(m_dcvWaterfallPlot, "高分辨反卷积(DCV) 全方位时空谱历程", QFont("sans", 12, QFont::Bold)));
-        dcvColLayout->addWidget(wrapPlotWithRangeControl(m_dcvWaterfallPlot, "聚焦方位角(°):", 0, 360, 0, 180));
-
-        connect(cmbDcvColor, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index){
-            QCPColorGradient grad = QCPColorGradient::gpJet;
-            if(index==1) grad = QCPColorGradient::gpHot; else if(index==2) grad = QCPColorGradient::gpThermal; else if(index==3) grad = QCPColorGradient::gpGrayscale; else if(index==4) grad = QCPColorGradient::gpPolar;
-            if (m_dcvWaterfallPlot && m_dcvWaterfallPlot->plottableCount() > 0) {
-                qobject_cast<QCPColorMap*>(m_dcvWaterfallPlot->plottable(0))->setGradient(grad);
-                m_dcvWaterfallPlot->replot();
-            }
-        });
-
-        waterfallsSplitter->addWidget(cbfColWidget);
-        waterfallsSplitter->addWidget(dcvColWidget);
+        waterfallsSplitter->addWidget(leftAreaW);
+        waterfallsSplitter->addWidget(rightAreaW);
         waterfallsSplitter->setStretchFactor(0, 1); waterfallsSplitter->setStretchFactor(1, 1);
         waterfallsSplitter->setSizes(QList<int>() << 1000 << 1000);
         tab2ContainerLayout->addWidget(waterfallsSplitter);
@@ -2024,7 +2084,7 @@ void MainWindow::setupUi() {
         // 修改 Tab 2 CBF 切片标签样式：由灰色改为醒目的青色系
         lblCbfSlice->setStyleSheet("QLabel { "
                                    "background-color: rgba(0, 206, 201, 0.15); " // 使用青色 (0, 206, 201) 的 15% 透明背景
-                                   "color: #00cec9; "                            // 字体颜色保持亮青色
+                                   "color: rgb(0, 206, 201); "                            // 字体颜色保持亮青色
                                    "font-weight: bold; "
                                    "font-size: 13px; "
                                    "padding: 6px; "
@@ -2034,7 +2094,7 @@ void MainWindow::setupUi() {
 
         QLabel* lblDcvSlice = new QLabel("高分辨 (DCV) 方位切片跟踪", tab2SliceHeader);
         lblDcvSlice->setAlignment(Qt::AlignCenter);
-        lblDcvSlice->setStyleSheet("QLabel { background-color: rgba(231, 76, 60, 0.15); color: #ff7675; font-weight: bold; font-size: 13px; padding: 6px; border-radius: 4px; border: 1px solid #d63031; }");
+        lblDcvSlice->setStyleSheet("QLabel { background-color: #e74d3c26; color: #ff7675; font-weight: bold; font-size: 13px; padding: 6px; border-radius: 4px; border: 1px solid #d63031; }");
 
         tab2SliceHeaderLayout->addWidget(lblCbfSlice);
         tab2SliceHeaderLayout->addWidget(lblDcvSlice);
@@ -2059,78 +2119,136 @@ void MainWindow::setupUi() {
         QWidget* tab3 = new QWidget();
         QVBoxLayout* tab3Layout = new QVBoxLayout(tab3);
 
-        // Tab 3 离线瀑布图的多列标签头 (固定在顶部)
-        QWidget* tab3HeaderBar = new QWidget(tab3);
-        QHBoxLayout* tab3HeaderLayout = new QHBoxLayout(tab3HeaderBar);
-        tab3HeaderLayout->setContentsMargins(0, 10, 15, 0);
+        // ===== 第一行：每列独立的聚焦频段控制 =====
+        QWidget* tab3FreqBar = new QWidget(tab3);
+        QHBoxLayout* tab3FreqLayout = new QHBoxLayout(tab3FreqBar);
+        tab3FreqLayout->setContentsMargins(0, 10, 15, 2);
 
-        QLabel* lblRaw = new QLabel("原始 LOFAR 谱 (RAW)", tab3HeaderBar);
-        lblRaw->setAlignment(Qt::AlignCenter);
-        lblRaw->setStyleSheet("QLabel { background-color: rgba(155, 89, 182, 0.15); color: #a29bfe; font-weight: bold; font-size: 13px; padding: 6px; border-radius: 4px; border: 1px solid #8e44ad; }");
+        auto buildFreqCol = [&](const QString& accentColor,
+                                 QDoubleSpinBox*& outMin, QDoubleSpinBox*& outMax) -> QWidget* {
+            QWidget* col = new QWidget(tab3FreqBar);
+            QHBoxLayout* colLayout = new QHBoxLayout(col);
+            colLayout->setContentsMargins(4, 1, 4, 1);
+            QLabel* lbl = new QLabel(QString::fromUtf8("聚焦频段(Hz):"), col);
+            lbl->setStyleSheet(QString("color: %1; font-size: 11px; font-weight: bold; border: none;").arg(accentColor));
+            outMin = new QDoubleSpinBox(col);
+            outMin->setRange(0, m_currentConfig.fs / 2.0);
+            outMin->setValue(m_currentConfig.lofarMin);
+            outMin->setDecimals(1); outMin->setSingleStep(10.0);
+            outMin->setStyleSheet("QDoubleSpinBox { background: #121212; color: #2ecc71; border: 1px solid #555; padding: 1px; font-size: 11px; }");
+            outMax = new QDoubleSpinBox(col);
+            outMax->setRange(0, m_currentConfig.fs / 2.0);
+            outMax->setValue(m_currentConfig.lofarMax);
+            outMax->setDecimals(1); outMax->setSingleStep(10.0);
+            outMax->setStyleSheet("QDoubleSpinBox { background: #121212; color: #2ecc71; border: 1px solid #555; padding: 1px; font-size: 11px; }");
+            colLayout->addWidget(lbl);
+            colLayout->addWidget(outMin);
+            colLayout->addWidget(new QLabel("-", col));
+            colLayout->addWidget(outMax);
+            colLayout->addStretch();
+            return col;
+        };
 
-        QLabel* lblTpsw = new QLabel("TPSW 背景均衡", tab3HeaderBar);
-        lblTpsw->setAlignment(Qt::AlignCenter);
-        lblTpsw->setStyleSheet("QLabel { background-color: rgba(52, 152, 219, 0.15); color: #74b9ff; font-weight: bold; font-size: 13px; padding: 6px; border-radius: 4px; border: 1px solid #2980b9; }");
+        QDoubleSpinBox *freqRawMin, *freqRawMax, *freqTpswMin, *freqTpswMax, *freqDpMin, *freqDpMax;
+        tab3FreqLayout->addWidget(buildFreqCol("#a29bfe", freqRawMin,  freqRawMax));
+        tab3FreqLayout->addWidget(buildFreqCol("#74b9ff", freqTpswMin, freqTpswMax));
+        tab3FreqLayout->addWidget(buildFreqCol("#fab1a0", freqDpMin,   freqDpMax));
+        tab3FreqLayout->setStretch(0, 1); tab3FreqLayout->setStretch(1, 1); tab3FreqLayout->setStretch(2, 1);
+        tab3Layout->addWidget(tab3FreqBar);
 
-        QLabel* lblDp = new QLabel("DP 线谱寻优", tab3HeaderBar);
-        lblDp->setAlignment(Qt::AlignCenter);
-        lblDp->setStyleSheet("QLabel { background-color: rgba(230, 126, 34, 0.15); color: #fab1a0; font-weight: bold; font-size: 13px; padding: 6px; border-radius: 4px; border: 1px solid #d35400; }");
+        // 频段切换：全局穿透更新所有对应列图表
+        auto connectFreqCtrl = [this](QDoubleSpinBox* spMin, QDoubleSpinBox* spMax, const QString& prefix) {
+            auto updateFreq = [this, prefix, spMin, spMax]() {
+                double fMin = spMin->value();
+                double fMax = spMax->value();
+                if (fMin >= fMax) return;
+                for (QWidget* w : QApplication::topLevelWidgets()) {
+                    for (QCustomPlot* p : w->findChildren<QCustomPlot*>()) {
+                        if (p->objectName().startsWith(prefix)) {
+                            p->xAxis->setRange(fMin, fMax);
+                            p->replot();
+                        }
+                    }
+                }
+            };
+            QObject::connect(spMin, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                spMin, [updateFreq, spMax](double v) { if (v < spMax->value()) updateFreq(); });
+            QObject::connect(spMax, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                spMax, [updateFreq, spMin](double v) { if (v > spMin->value()) updateFreq(); });
+        };
+        connectFreqCtrl(freqRawMin,  freqRawMax,  "offline_raw_");
+        connectFreqCtrl(freqTpswMin, freqTpswMax, "offline_tpsw_");
+        connectFreqCtrl(freqDpMin,   freqDpMax,   "offline_dp_");
 
-        tab3HeaderLayout->addWidget(lblRaw);
-        tab3HeaderLayout->addWidget(lblTpsw);
-        tab3HeaderLayout->addWidget(lblDp);
-        tab3HeaderLayout->setStretch(0, 1); tab3HeaderLayout->setStretch(1, 1); tab3HeaderLayout->setStretch(2, 1);
-        tab3Layout->addWidget(tab3HeaderBar);
+        // ===== 第二行：小标题 + 风格选择（合并为一行）=====
+        QWidget* tab3TitleBar = new QWidget(tab3);
+        QHBoxLayout* tab3TitleLayout = new QHBoxLayout(tab3TitleBar);
+        tab3TitleLayout->setContentsMargins(0, 2, 15, 5);
 
-        // Tab 3 控制横幅 (包含三列的下拉框)
-        QWidget* tab3ControlBar = new QWidget(tab3);
-        QHBoxLayout* tab3ControlLayout = new QHBoxLayout(tab3ControlBar);
-        tab3ControlLayout->setContentsMargins(0, 5, 15, 5);
+        auto buildTitleCol = [](QWidget* parent, const QString& title, const QString& accentColor,
+                                 const QString& borderColor, const QString& cmbObjName,
+                                 const QString& cmbPrefix, QComboBox*& outCmb) -> QWidget* {
+            QWidget* col = new QWidget(parent);
+            QHBoxLayout* colLayout = new QHBoxLayout(col);
+            colLayout->setContentsMargins(4, 1, 4, 1);
+            QLabel* lbl = new QLabel(title, col);
+            lbl->setStyleSheet(QString(
+                "QLabel { color: %1; font-weight: bold; font-size: 11px;"
+                " padding: 2px 5px; border: none; }").arg(accentColor));
+            outCmb = new QComboBox(col);
+            outCmb->setObjectName(cmbObjName);
+            outCmb->addItems({
+                QString::fromUtf8("\xF0\x9F\x8C\x88") + " " + cmbPrefix + " Jet",
+                QString::fromUtf8("\xF0\x9F\x94\xA5") + " " + cmbPrefix + " Hot",
+                QString::fromUtf8("\xF0\x9F\x8C\x8C") + " " + cmbPrefix + " Thermal",
+                QString::fromUtf8("\xE2\x9A\xAB") + " " + cmbPrefix + " Grayscale",
+                QString::fromUtf8("\xE2\x9D\x84") + " " + cmbPrefix + " Polar"
+            });
+            outCmb->setStyleSheet(QString(
+                "QComboBox { background-color: #1a1a1a; color: %1; border: 1px solid %2;"
+                " font-weight: bold; font-size: 11px; border-radius: 3px; padding: 2px 4px; }"
+                "QComboBox QAbstractItemView { background-color: #1a1a1a; color: #ddd;"
+                " selection-background-color: #333; border: 1px solid #555; }")
+                .arg(accentColor).arg(borderColor));
+            colLayout->addWidget(lbl);
+            colLayout->addWidget(outCmb);
+            colLayout->addStretch();
+            return col;
+        };
 
-        // 【意见二修改】：废弃统一的黄色样式，为三个下拉框分别定制专属色彩
-            QComboBox* cmbRaw = new QComboBox(tab3ControlBar); cmbRaw->setObjectName("cmbColorTab3_RAW");
-            cmbRaw->addItems({"🌈 RAW 风格: Jet", "🔥 RAW 风格: Hot", "🌌 RAW 风格: Thermal", "⚫ RAW 风格: Grayscale", "❄️ RAW 风格: Polar"});
-            // 对应 RAW 标题的紫色 (#a29bfe)
-            cmbRaw->setStyleSheet("QComboBox { background-color: #1a1a1a; color: #a29bfe; border: 1px solid #8e44ad; font-weight: bold; border-radius: 4px; padding: 4px; }");
+        QComboBox *cmbRaw, *cmbTpsw, *cmbDp;
+        tab3TitleLayout->addWidget(buildTitleCol(tab3TitleBar,
+            QString::fromUtf8("RAW \xE5\x8E\x9F\xE5\xA7\x8B\xE8\xB0\xB1"), "#a29bfe", "#8e44ad",
+            "cmbColorTab3_RAW", "RAW", cmbRaw));
+        tab3TitleLayout->addWidget(buildTitleCol(tab3TitleBar,
+            QString::fromUtf8("TPSW \xE5\x9D\x87\xE8\xA1\xA1\xE8\xB0\xB1"), "#74b9ff", "#2980b9",
+            "cmbColorTab3_TPSW", "TPSW", cmbTpsw));
+        tab3TitleLayout->addWidget(buildTitleCol(tab3TitleBar,
+            QString::fromUtf8("DP \xE5\xAF\xBB\xE4\xBC\x98\xE8\xBD\xA8\xE8\xBF\xB9"), "#fab1a0", "#d35400",
+            "cmbColorTab3_DP", "DP", cmbDp));
+        tab3TitleLayout->setStretch(0, 1); tab3TitleLayout->setStretch(1, 1); tab3TitleLayout->setStretch(2, 1);
+        tab3Layout->addWidget(tab3TitleBar);
 
-            QComboBox* cmbTpsw = new QComboBox(tab3ControlBar); cmbTpsw->setObjectName("cmbColorTab3_TPSW");
-            cmbTpsw->addItems({"🌈 TPSW 风格: Jet", "🔥 TPSW 风格: Hot", "🌌 TPSW 风格: Thermal", "⚫ TPSW 风格: Grayscale", "❄️ TPSW 风格: Polar"});
-            // 对应 TPSW 标题的蓝色 (#74b9ff)
-            cmbTpsw->setStyleSheet("QComboBox { background-color: #1a1a1a; color: #74b9ff; border: 1px solid #2980b9; font-weight: bold; border-radius: 4px; padding: 4px; }");
-
-            QComboBox* cmbDp = new QComboBox(tab3ControlBar); cmbDp->setObjectName("cmbColorTab3_DP");
-            cmbDp->addItems({"🌈 DP 风格: Jet", "🔥 DP 风格: Hot", "🌌 DP 风格: Thermal", "⚫ DP 风格: Grayscale", "❄️ DP 风格: Polar"});
-            // 对应 DP 标题的橙色 (#fab1a0)
-            cmbDp->setStyleSheet("QComboBox { background-color: #1a1a1a; color: #fab1a0; border: 1px solid #d35400; font-weight: bold; border-radius: 4px; padding: 4px; }");
-
-        tab3ControlLayout->addWidget(cmbRaw);
-        tab3ControlLayout->addWidget(cmbTpsw);
-        tab3ControlLayout->addWidget(cmbDp);
-        tab3ControlLayout->setStretch(0, 1); tab3ControlLayout->setStretch(1, 1); tab3ControlLayout->setStretch(2, 1);
-        tab3Layout->addWidget(tab3ControlBar);
-
-        // 【完美优化】：全局穿透更新样式，哪怕图表被弹出了，依然能丝滑变色，且绝不闪退！
-            auto connectTab3Combo = [this](QComboBox* cmb, const QString& prefix) {
-                connect(cmb, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this, prefix](int index){
-                    QCPColorGradient grad = QCPColorGradient::gpJet;
-                    if(index==1) grad = QCPColorGradient::gpHot; else if(index==2) grad = QCPColorGradient::gpThermal; else if(index==3) grad = QCPColorGradient::gpGrayscale; else if(index==4) grad = QCPColorGradient::gpPolar;
-
-                    // 全局扫描：遍历包括主窗口和所有独立弹窗在内的大网
-                    for (QWidget* w : QApplication::topLevelWidgets()) {
-                        for (QCustomPlot* p : w->findChildren<QCustomPlot*>()) {
-                            if (p->objectName().startsWith(prefix) && p->plottableCount() > 0) {
-                                if (auto* cmap = qobject_cast<QCPColorMap*>(p->plottable(0))) {
-                                    cmap->setGradient(grad);
-                                    p->replot();
-                                }
+        // ===== 风格切换：全局穿透更新（逻辑不变）=====
+        auto connectTab3Combo = [this](QComboBox* cmb, const QString& prefix) {
+            connect(cmb, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this, prefix](int index){
+                QCPColorGradient grad = QCPColorGradient::gpJet;
+                if(index==1) grad = QCPColorGradient::gpHot; else if(index==2) grad = QCPColorGradient::gpThermal; else if(index==3) grad = QCPColorGradient::gpGrayscale; else if(index==4) grad = QCPColorGradient::gpPolar;
+                for (QWidget* w : QApplication::topLevelWidgets()) {
+                    for (QCustomPlot* p : w->findChildren<QCustomPlot*>()) {
+                        if (p->objectName().startsWith(prefix) && p->plottableCount() > 0) {
+                            if (auto* cmap = qobject_cast<QCPColorMap*>(p->plottable(0))) {
+                                cmap->setGradient(grad);
+                                p->replot();
                             }
                         }
                     }
-                });
-            };
-            connectTab3Combo(cmbRaw, "offline_raw_");
-            connectTab3Combo(cmbTpsw, "offline_tpsw_");
-            connectTab3Combo(cmbDp, "offline_dp_");
+                }
+            });
+        };
+        connectTab3Combo(cmbRaw,  "offline_raw_");
+        connectTab3Combo(cmbTpsw, "offline_tpsw_");
+        connectTab3Combo(cmbDp,   "offline_dp_");
 
         QScrollArea* lofarScroll = new QScrollArea(tab3);
         lofarScroll->setObjectName("scrollTab3"); // 【新增户口】
@@ -2164,9 +2282,13 @@ void MainWindow::setupUi() {
     cardsLayout->setContentsMargins(0, 0, 0, 0);
     m_lblStatTime = new QLabel("--"); m_lblStatTargets = new QLabel("--"); m_lblStatAvgAcc = new QLabel("--");
     // 修改为深灰色底
-    cardsLayout->addWidget(createCardWidget(m_lblStatTime, "#1e1e1e", "系统全流程解算耗时分布"));
-    cardsLayout->addWidget(createCardWidget(m_lblStatTargets, "#1e1e1e", "稳定识别/锁定目标总数"));
-    cardsLayout->addWidget(createCardWidget(m_lblStatAvgAcc, "#1e1e1e", "全局平均线谱提取正确率"));
+    cardsLayout->addWidget(createCardWidget(m_lblStatTime, "#1e1e1e", "系统运行时长", 14));
+    cardsLayout->addWidget(createCardWidget(m_lblStatTargets, "#1e1e1e", "稳定识别/锁定目标总数", 14));
+    cardsLayout->addWidget(createCardWidget(m_lblStatAvgAcc, "#1e1e1e", "漏情概率", 20));
+    m_lblFeatureIdentifyRate = new QLabel("--");
+    cardsLayout->addWidget(createCardWidget(m_lblFeatureIdentifyRate, "#1e1e1e", "互扰特征鉴别正确率", 20));
+    m_lblAutonomousScreeningRate = new QLabel("--");
+    cardsLayout->addWidget(createCardWidget(m_lblAutonomousScreeningRate, "#1e1e1e", "自主筛选正确率", 20));
     tab4Layout->addWidget(cardsWidget);
 
     // 【修改 3】：挂载父级改为 tab4Container
@@ -2178,19 +2300,18 @@ void MainWindow::setupUi() {
     tablesLayout->setSpacing(10);
 
     m_tableTargetFeatures = new QTableWidget(tablesContainer);
-    m_tableTargetFeatures->setColumnCount(9);
-    m_tableTargetFeatures->setHorizontalHeaderLabels({"目标名称/ID", "瞬时线谱群", "瞬时准度", "累积DCV线谱", "DCV准度", "稳定轴频", "真实方位", "解算方位", "综合判定"});
+    m_tableTargetFeatures->setColumnCount(8);
+    m_tableTargetFeatures->setHorizontalHeaderLabels({"目标名称/ID", "当前估计线谱频率", "当前估计方位", "当前估计轴频", "当前真实线谱频率", "当前真实方位", "当前自主筛选正确率", "综合判定"});
     m_tableTargetFeatures->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
     m_tableTargetFeatures->horizontalHeader()->setStretchLastSection(true);
     m_tableTargetFeatures->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
     m_tableTargetFeatures->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
     m_tableTargetFeatures->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
-    m_tableTargetFeatures->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
-    m_tableTargetFeatures->horizontalHeader()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
+    m_tableTargetFeatures->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+    m_tableTargetFeatures->horizontalHeader()->setSectionResizeMode(4, QHeaderView::Stretch);
     m_tableTargetFeatures->horizontalHeader()->setSectionResizeMode(5, QHeaderView::ResizeToContents);
     m_tableTargetFeatures->horizontalHeader()->setSectionResizeMode(6, QHeaderView::ResizeToContents);
     m_tableTargetFeatures->horizontalHeader()->setSectionResizeMode(7, QHeaderView::ResizeToContents);
-    m_tableTargetFeatures->horizontalHeader()->setSectionResizeMode(8, QHeaderView::ResizeToContents);
     m_tableTargetFeatures->setEditTriggers(QAbstractItemView::DoubleClicked);
     m_tableTargetFeatures->setAlternatingRowColors(true);
     // 替换 m_tableTargetFeatures 的样式
@@ -2234,7 +2355,7 @@ void MainWindow::setupUi() {
 
     m_plotCalcAzimuth = new QCustomPlot(midPlotsSplitter);
     m_plotCalcAzimuth->setMinimumSize(300, 200); m_plotCalcAzimuth->setStyleSheet("background-color: white; border-radius: 8px;");
-    m_plotCalcAzimuth->plotLayout()->insertRow(0); m_plotCalcAzimuth->plotLayout()->addElement(0, 0, new QCPTextElement(m_plotCalcAzimuth, "解算跟踪方位轨迹演变", QFont("sans", 12, QFont::Bold)));
+    m_plotCalcAzimuth->plotLayout()->insertRow(0); m_plotCalcAzimuth->plotLayout()->addElement(0, 0, new QCPTextElement(m_plotCalcAzimuth, "计算方位轨迹演变", QFont("sans", 12, QFont::Bold)));
     m_plotCalcAzimuth->xAxis->setLabel("监控周期 (批次)"); m_plotCalcAzimuth->yAxis->setLabel("解算方位角 (°)");
     m_plotCalcAzimuth->yAxis->setRange(0, 180);
     setupPlotInteraction(m_plotCalcAzimuth);
@@ -2249,7 +2370,7 @@ void MainWindow::setupUi() {
     QSplitter* bottomPlotsSplitter = new QSplitter(Qt::Horizontal, tab4ContentSplitter);
     m_plotTargetAccuracy = new QCustomPlot(bottomPlotsSplitter);
     m_plotTargetAccuracy->setMinimumSize(300, 200); m_plotTargetAccuracy->setStyleSheet("background-color: white; border-radius: 8px;");
-    m_plotTargetAccuracy->plotLayout()->insertRow(0); m_plotTargetAccuracy->plotLayout()->addElement(0, 0, new QCPTextElement(m_plotTargetAccuracy, "各独立目标特征提取正确率", QFont("sans", 12, QFont::Bold)));
+    m_plotTargetAccuracy->plotLayout()->insertRow(0); m_plotTargetAccuracy->plotLayout()->addElement(0, 0, new QCPTextElement(m_plotTargetAccuracy, "瞬时准度/DCV准度", QFont("sans", 12, QFont::Bold)));
     m_plotTargetAccuracy->legend->setBrush(QColor(20, 20, 20, 200));
     m_plotTargetAccuracy->legend->setTextColor(QColor("#dcdde1"));
     m_accuracyBars = new QCPBars(m_plotTargetAccuracy->xAxis, m_plotTargetAccuracy->yAxis);
@@ -2286,6 +2407,34 @@ void MainWindow::setupUi() {
     m_plotBatchAccuracy->xAxis->setLabel("运算监测批次"); m_plotBatchAccuracy->yAxis->setLabel("批次综合正确率 (%)"); m_plotBatchAccuracy->yAxis->setRange(0, 105);
     setupPlotInteraction(m_plotBatchAccuracy);
     bottomPlotsSplitter->addWidget(m_plotBatchAccuracy);
+
+    // 【新增】互扰特征鉴别正确率趋势图
+    m_plotFeatureIdentifyRate = new QCustomPlot(bottomPlotsSplitter);
+    m_plotFeatureIdentifyRate->setMinimumSize(250, 200);
+    m_plotFeatureIdentifyRate->setStyleSheet("background-color: white; border-radius: 8px;");
+    m_plotFeatureIdentifyRate->plotLayout()->insertRow(0);
+    m_plotFeatureIdentifyRate->plotLayout()->addElement(0, 0,
+        new QCPTextElement(m_plotFeatureIdentifyRate, "互扰特征鉴别正确率",
+                           QFont("sans", 12, QFont::Bold)));
+    m_plotFeatureIdentifyRate->xAxis->setLabel("批次");
+    m_plotFeatureIdentifyRate->yAxis->setLabel("互扰特征鉴别正确率(%)");
+    m_plotFeatureIdentifyRate->yAxis->setRange(0, 100);
+    setupPlotInteraction(m_plotFeatureIdentifyRate);
+    bottomPlotsSplitter->addWidget(m_plotFeatureIdentifyRate);
+
+    // 【新增】自主筛选正确率趋势图
+    m_plotAutonomousScreeningRate = new QCustomPlot(bottomPlotsSplitter);
+    m_plotAutonomousScreeningRate->setMinimumSize(250, 200);
+    m_plotAutonomousScreeningRate->setStyleSheet("background-color: white; border-radius: 8px;");
+    m_plotAutonomousScreeningRate->plotLayout()->insertRow(0);
+    m_plotAutonomousScreeningRate->plotLayout()->addElement(0, 0,
+        new QCPTextElement(m_plotAutonomousScreeningRate, "自主筛选正确率",
+                           QFont("sans", 12, QFont::Bold)));
+    m_plotAutonomousScreeningRate->xAxis->setLabel("批次");
+    m_plotAutonomousScreeningRate->yAxis->setLabel("自主筛选正确率(%)");
+    m_plotAutonomousScreeningRate->yAxis->setRange(0, 100);
+    setupPlotInteraction(m_plotAutonomousScreeningRate);
+    bottomPlotsSplitter->addWidget(m_plotAutonomousScreeningRate);
 
     tab4ContentSplitter->addWidget(bottomPlotsSplitter);
     tab4ContentSplitter->setStretchFactor(0, 3);
@@ -2564,8 +2713,8 @@ void MainWindow::onExportClicked() {
         savePlot(m_demonPlots[tid], QString("Target_%1_DEMON").arg(tid));
     }
 
-    savePlot(m_cbfWaterfallPlot, "CBF_Waterfall");
-    savePlot(m_dcvWaterfallPlot, "DCV_Waterfall");
+    savePlot(m_leftWaterfallPlot, "Left_Waterfall");
+    savePlot(m_rightWaterfallPlot, "Right_Waterfall");
 
     auto saveLayoutPlots = [&](QLayout* layout, const QString& fallbackPrefix) {
         if (!layout) return;
@@ -2584,6 +2733,7 @@ void MainWindow::onExportClicked() {
     // 【新增】：将 Tab4 仪表盘上的所有图表也全部加入导出名单
     savePlot(m_plotTargetAccuracy, "Dashboard_Target_Accuracy");
     savePlot(m_plotBatchAccuracy, "Dashboard_Batch_Trend");
+    if (m_plotAutonomousScreeningRate) savePlot(m_plotAutonomousScreeningRate, "Dashboard_AutonomousScreening_Trend");
     if (m_plotTrueAzimuth) savePlot(m_plotTrueAzimuth, "Dashboard_TrueAzimuth_Trend");
     if (m_plotCalcAzimuth) savePlot(m_plotCalcAzimuth, "Dashboard_CalcAzimuth_Trend");
 
@@ -2598,6 +2748,9 @@ void MainWindow::onExportClicked() {
     }
     if (m_lblStatAvgAcc && m_lblStatAvgAcc->parentWidget()) {
         m_lblStatAvgAcc->parentWidget()->grab().save(plotsDirPath + "/Dashboard_4_Card_AvgAccuracy.png");
+    }
+    if (m_lblAutonomousScreeningRate && m_lblAutonomousScreeningRate->parentWidget()) {
+        m_lblAutonomousScreeningRate->parentWidget()->grab().save(plotsDirPath + "/Dashboard_5_Card_AutonomousScreening.png");
     }
 
     // =========================================================
@@ -3063,6 +3216,7 @@ void MainWindow::onOfflineResultsReady(const QList<OfflineTargetResult>& results
             pRaw->plotLayout()->addElement(0, 0, titleRaw);
 
             QWidget* wRaw = wrapPlotWithRangeControl(pRaw, "聚焦频段(Hz):", 0, m_currentConfig.fs/2.0, res.displayFreqMin, res.displayFreqMax);
+            if (QWidget* ctrlBar = wRaw->findChild<QWidget*>("rangeCtrlBar")) ctrlBar->hide();
             wRaw->setMinimumSize(0, isAutoFit ? 0 : minHeight + 30);
             m_lofarWaterfallLayout->addWidget(wRaw, row, 0);
         } else {
@@ -3110,6 +3264,7 @@ void MainWindow::onOfflineResultsReady(const QList<OfflineTargetResult>& results
             pTpsw->plotLayout()->addElement(0, 0, titleTpsw);
 
             QWidget* wTpsw = wrapPlotWithRangeControl(pTpsw, "聚焦频段(Hz):", 0, m_currentConfig.fs/2.0, res.displayFreqMin, res.displayFreqMax);
+            if (QWidget* ctrlBar = wTpsw->findChild<QWidget*>("rangeCtrlBar")) ctrlBar->hide();
             wTpsw->setMinimumSize(0, isAutoFit ? 0 : minHeight + 30);
             m_lofarWaterfallLayout->addWidget(wTpsw, row, 1);
         } else {
@@ -3158,6 +3313,7 @@ void MainWindow::onOfflineResultsReady(const QList<OfflineTargetResult>& results
             pDp->plotLayout()->addElement(0, 0, titleDp);
 
             QWidget* wDp = wrapPlotWithRangeControl(pDp, "聚焦频段(Hz):", 0, m_currentConfig.fs/2.0, res.displayFreqMin, res.displayFreqMax);
+            if (QWidget* ctrlBar = wDp->findChild<QWidget*>("rangeCtrlBar")) ctrlBar->hide();
             wDp->setMinimumSize(0, isAutoFit ? 0 : minHeight + 30);
             m_lofarWaterfallLayout->addWidget(wDp, row, 2);
         } else {
@@ -3199,27 +3355,17 @@ void MainWindow::updateTab2Plots() {
     if (std::abs(max_time - min_time) < 0.1) max_time = min_time + 3.0;
 
     int nx_uniform = 361;
-    QCPColorMap *cmapCbf = nullptr;
-    if (m_cbfWaterfallPlot->plottableCount() > 0) cmapCbf = qobject_cast<QCPColorMap*>(m_cbfWaterfallPlot->plottable(0));
-    if (!cmapCbf) cmapCbf = new QCPColorMap(m_cbfWaterfallPlot->xAxis, m_cbfWaterfallPlot->yAxis);
+    // 获取左右区算法模式
+    int leftAlgo = m_cmbLeftAlgo ? m_cmbLeftAlgo->currentIndex() : 0;
+    int rightAlgo = m_cmbRightAlgo ? m_cmbRightAlgo->currentIndex() : 1;
 
-    QCPColorMap *cmapDcv = nullptr;
-    if (m_dcvWaterfallPlot->plottableCount() > 0) cmapDcv = qobject_cast<QCPColorMap*>(m_dcvWaterfallPlot->plottable(0));
-    if (!cmapDcv) cmapDcv = new QCPColorMap(m_dcvWaterfallPlot->xAxis, m_dcvWaterfallPlot->yAxis);
-
-    cmapCbf->data()->setSize(nx_uniform, num_frames);
-    cmapCbf->data()->setRange(QCPRange(0, 180), QCPRange(min_time, max_time));
-    cmapDcv->data()->setSize(nx_uniform, num_frames);
-    cmapDcv->data()->setRange(QCPRange(0, 180), QCPRange(min_time, max_time));
-
+    // ===== 单次遍历：计算 CBF/DCV 数据极值 =====
     double cbf_max = -9999.0, dcv_max = -9999.0;
-
     for (int t = 0; t < num_frames; ++t) {
         const auto& frame = m_historyResults[t];
         const QVector<double>& theta_arr = frame.thetaAxis;
         const QVector<double>& cbf_arr = frame.cbfData;
         const QVector<double>& dcv_arr = frame.dcvData;
-
         for (int x = 0; x < nx_uniform; ++x) {
             double target_theta = x * 0.5;
             double v_cbf = -120.0, v_dcv = -120.0;
@@ -3242,46 +3388,84 @@ void MainWindow::updateTab2Plots() {
                     }
                 }
             }
-            cmapCbf->data()->setCell(x, t, v_cbf);
-            cmapDcv->data()->setCell(x, t, v_dcv);
             if (v_cbf > cbf_max) cbf_max = v_cbf;
             if (v_dcv > dcv_max) dcv_max = v_dcv;
         }
     }
 
-    // ========================================================
-    // 【终极修复】：全屏穿透扫描颜色，防止弹窗后丢失风格
-    // ========================================================
-    auto getGrad = [this](const QString& objName) -> QCPColorGradient {
-        QComboBox* cmb = nullptr;
-        for (QWidget* widget : QApplication::topLevelWidgets()) {
-            cmb = widget->findChild<QComboBox*>(objName);
-            if (cmb) break;
+    // ===== 通用渲染 lambda：按算法模式填充单个绘图区 =====
+    auto renderArea = [&](int algoMode, QCustomPlot* plot, QComboBox* cmbColor,
+                           double dataMax, const QString& algoLabel) {
+        if (!plot) return;
+        QCPColorMap* cmap = nullptr;
+        if (plot->plottableCount() > 0)
+            cmap = qobject_cast<QCPColorMap*>(plot->plottable(0));
+        if (!cmap)
+            cmap = new QCPColorMap(plot->xAxis, plot->yAxis);
+
+        cmap->data()->setSize(nx_uniform, num_frames);
+        cmap->data()->setRange(QCPRange(0, 180), QCPRange(min_time, max_time));
+
+        for (int t = 0; t < num_frames; ++t) {
+            const auto& frame = m_historyResults[t];
+            const QVector<double>& theta_arr = frame.thetaAxis;
+            const QVector<double>& data_arr = (algoMode == 0) ? frame.cbfData : frame.dcvData;
+            for (int x = 0; x < nx_uniform; ++x) {
+                double target_theta = x * 0.5;
+                double v = -120.0;
+                if (theta_arr.size() > 1) {
+                    if (target_theta <= theta_arr.first()) v = data_arr.first();
+                    else if (target_theta >= theta_arr.last()) v = data_arr.last();
+                    else {
+                        auto it = std::lower_bound(theta_arr.begin(), theta_arr.end(), target_theta);
+                        int idx = std::distance(theta_arr.begin(), it);
+                        if (idx > 0 && idx < theta_arr.size()) {
+                            double t1 = theta_arr[idx - 1], t2 = theta_arr[idx];
+                            double c1 = data_arr[idx - 1], c2 = data_arr[idx];
+                            v = (t2 - t1 > 1e-6)
+                                ? (c1 + (c2 - c1) * (target_theta - t1) / (t2 - t1))
+                                : c1;
+                        }
+                    }
+                }
+                cmap->data()->setCell(x, t, v);
+            }
         }
 
-        if (!cmb) return QCPColorGradient::gpJet;
+        // 颜色渐变
+        int colorIdx = cmbColor ? cmbColor->currentIndex() : 0;
+        QCPColorGradient grad = QCPColorGradient::gpJet;
+        if (colorIdx == 1) grad = QCPColorGradient::gpHot;
+        else if (colorIdx == 2) grad = QCPColorGradient::gpThermal;
+        else if (colorIdx == 3) grad = QCPColorGradient::gpGrayscale;
+        else if (colorIdx == 4) grad = QCPColorGradient::gpPolar;
 
-        int idx = cmb->currentIndex();
-        if(idx == 1) return QCPColorGradient::gpHot;
-        if(idx == 2) return QCPColorGradient::gpThermal;
-        if(idx == 3) return QCPColorGradient::gpGrayscale;
-        if(idx == 4) return QCPColorGradient::gpPolar;
-        return QCPColorGradient::gpJet;
+        cmap->setGradient(grad);
+        cmap->setInterpolate(true);
+        cmap->setDataRange(QCPRange(dataMax - 20.0, dataMax));
+        cmap->setTightBoundary(true);
+
+        plot->xAxis->setLabel("方位角/°");
+        plot->yAxis->setLabel("物理时间/s");
+        plot->yAxis->setRange(min_time, max_time);
+
+        // 标题
+        if (auto* title = qobject_cast<QCPTextElement*>(plot->plotLayout()->element(0, 0))) {
+            title->setText(QString("%1 空间谱历程").arg(algoLabel));
+            QColor accent = (algoMode == 0) ? QColor("#00cec9") : QColor("#ff7675");
+            title->setTextColor(accent);
+        }
+
+        plot->replot();
+        updatePlotOriginalRange(plot);
     };
 
-    cmapCbf->setGradient(getGrad("cmbColorTab2_CBF"));
-    cmapCbf->setInterpolate(true);
-    cmapCbf->setDataRange(QCPRange(cbf_max - 20.0, cbf_max)); cmapCbf->setTightBoundary(true);
-    m_cbfWaterfallPlot->xAxis->setLabel("方位角/°"); m_cbfWaterfallPlot->yAxis->setLabel("物理时间/s");
-    m_cbfWaterfallPlot->yAxis->setRange(min_time, max_time);
-    m_cbfWaterfallPlot->replot(); updatePlotOriginalRange(m_cbfWaterfallPlot);
-
-    cmapDcv->setGradient(getGrad("cmbColorTab2_DCV"));
-    cmapDcv->setInterpolate(true);
-    cmapDcv->setDataRange(QCPRange(dcv_max - 20.0, dcv_max)); cmapDcv->setTightBoundary(true);
-    m_dcvWaterfallPlot->xAxis->setLabel("方位角/°"); m_dcvWaterfallPlot->yAxis->setLabel("物理时间/s");
-    m_dcvWaterfallPlot->yAxis->setRange(min_time, max_time);
-    m_dcvWaterfallPlot->replot(); updatePlotOriginalRange(m_dcvWaterfallPlot);
+    renderArea(leftAlgo,  m_leftWaterfallPlot,  m_cmbLeftColor,
+               (leftAlgo == 0) ? cbf_max : dcv_max,
+               (leftAlgo == 0) ? "常规波束形成(CBF)" : "高分辨反卷积(DCV)");
+    renderArea(rightAlgo, m_rightWaterfallPlot, m_cmbRightColor,
+               (rightAlgo == 0) ? cbf_max : dcv_max,
+               (rightAlgo == 0) ? "常规波束形成(CBF)" : "高分辨反卷积(DCV)");
 
     QSet<int> targetIds;
     for (const auto& frame : m_historyResults) {
@@ -3468,7 +3652,110 @@ void MainWindow::onBatchAccuracyComputed(int batchIndex, double accuracy) {
     }
 }
 
-QWidget* MainWindow::createCardWidget(QLabel* contentLabel, const QString& bgColor, const QString& title) {
+void MainWindow::onBatchFeatureIdentifyRateComputed(
+    int batchIndex, double rate,
+    int matchedCount, int truthCount, int falseAlarmCount)
+{
+    m_batchFeatureIdentifyIndexes.append(batchIndex);
+    m_batchFeatureIdentifyRates.append(rate);
+
+    QString color;
+    if (rate >= 80.0) {
+        color = "#27ae60";
+    } else if (rate >= 60.0) {
+        color = "#f39c12";
+    } else {
+        color = "#e74c3c";
+    }
+
+    if (m_lblFeatureIdentifyRate) {
+        m_lblFeatureIdentifyRate->setText(QString(
+            "<span style='font-size:34px; color:%1;'>%2%</span>"
+            "<br><span style='font-size:13px; color:#95a5a6;'>累计命中 %3/%4，虚警次数 %5</span>")
+            .arg(color)
+            .arg(rate, 0, 'f', 1)
+            .arg(matchedCount)
+            .arg(truthCount)
+            .arg(falseAlarmCount));
+    }
+
+    if (m_plotFeatureIdentifyRate) {
+        m_plotFeatureIdentifyRate->clearGraphs();
+        m_plotFeatureIdentifyRate->addGraph();
+
+        QVector<double> x;
+        QVector<double> y;
+
+        for (int i = 0; i < m_batchFeatureIdentifyRates.size(); ++i) {
+            x.append(m_batchFeatureIdentifyIndexes[i]);
+            y.append(m_batchFeatureIdentifyRates[i]);
+        }
+
+        m_plotFeatureIdentifyRate->graph(0)->setData(x, y);
+        m_plotFeatureIdentifyRate->xAxis->setLabel("批次");
+        m_plotFeatureIdentifyRate->yAxis->setLabel("互扰特征鉴别正确率(%)");
+        m_plotFeatureIdentifyRate->yAxis->setRange(0, 100);
+
+        if (!x.isEmpty()) {
+            m_plotFeatureIdentifyRate->xAxis->setRange(0, x.last() + 1);
+        }
+
+        m_plotFeatureIdentifyRate->rescaleAxes(true);
+        m_plotFeatureIdentifyRate->yAxis->setRange(0, 100);
+        m_plotFeatureIdentifyRate->replot();
+    }
+}
+
+void MainWindow::onAutonomousScreeningAccuracyComputed(
+    int batchIndex, double rate, int totalGroupCount)
+{
+    m_latestAutonomousScreeningRate = rate;
+
+    if (m_lblAutonomousScreeningRate) {
+        QString color;
+        if (rate >= 80.0) {
+            color = "#27ae60";
+        } else if (rate >= 60.0) {
+            color = "#f39c12";
+        } else {
+            color = "#e74c3c";
+        }
+        m_lblAutonomousScreeningRate->setText(QString(
+            "<span style='font-size:34px; color:%1;'>%2%</span>")
+            .arg(color)
+            .arg(rate, 0, 'f', 1));
+    }
+
+    m_autonomousScreeningIndexes.append(batchIndex);
+    m_autonomousScreeningRates.append(rate);
+
+    if (m_plotAutonomousScreeningRate) {
+        m_plotAutonomousScreeningRate->clearGraphs();
+        m_plotAutonomousScreeningRate->addGraph();
+
+        QVector<double> x;
+        QVector<double> y;
+        for (int i = 0; i < m_autonomousScreeningRates.size(); ++i) {
+            x.append(m_autonomousScreeningIndexes[i]);
+            y.append(m_autonomousScreeningRates[i]);
+        }
+
+        m_plotAutonomousScreeningRate->graph(0)->setData(x, y);
+        m_plotAutonomousScreeningRate->xAxis->setLabel("批次");
+        m_plotAutonomousScreeningRate->yAxis->setLabel("自主筛选正确率(%)");
+        m_plotAutonomousScreeningRate->yAxis->setRange(0, 100);
+
+        if (!x.isEmpty()) {
+            m_plotAutonomousScreeningRate->xAxis->setRange(0, x.last() + 1);
+        }
+
+        m_plotAutonomousScreeningRate->rescaleAxes(true);
+        m_plotAutonomousScreeningRate->yAxis->setRange(0, 100);
+        m_plotAutonomousScreeningRate->replot();
+    }
+}
+
+QWidget* MainWindow::createCardWidget(QLabel* contentLabel, const QString& bgColor, const QString& title, int titleFontSize) {
     QFrame* frame = new QFrame();
     // 边框改为暗色 #333
     frame->setStyleSheet(QString("QFrame { background-color: %1; border-radius: 10px; border: 1px solid #333; }").arg(bgColor));
@@ -3476,7 +3763,7 @@ QWidget* MainWindow::createCardWidget(QLabel* contentLabel, const QString& bgCol
 
     QLabel* titleLabel = new QLabel(title);
     // 标题文字改为亮灰色 #a0a0a0
-    titleLabel->setStyleSheet("color: #a0a0a0; font-size: 14px; font-weight: bold; border: none;");
+    titleLabel->setStyleSheet(QString("color: #a0a0a0; font-size: %1px; font-weight: bold; border: none;").arg(titleFontSize));
     titleLabel->setAlignment(Qt::AlignCenter);
     layout->addWidget(titleLabel);
 
@@ -3554,34 +3841,56 @@ void MainWindow::onEvaluationResultReady(const SystemEvaluationResult& res) {
 
         m_tableTargetFeatures->insertRow(i);
 
+        // 第0列：目标名称/ID
         auto* nameItem = new QTableWidgetItem(displayName);
         nameItem->setData(Qt::UserRole, eval.targetId);
         nameItem->setFlags(Qt::ItemIsSelectable | Qt::ItemIsEditable | Qt::ItemIsEnabled);
         m_tableTargetFeatures->setItem(i, 0, nameItem);
 
-        m_tableTargetFeatures->setItem(i, 1, new QTableWidgetItem(eval.lineSpectraStr));
+        // 第1列：当前估计线谱频率，只显示频率不显示出现次数
+        QString estimatedFreqStr = stripLineSpectrumCounts(eval.lineSpectraStr);
+        if (estimatedFreqStr.isEmpty()) {
+            estimatedFreqStr = "--";
+        }
+        m_tableTargetFeatures->setItem(i, 1, new QTableWidgetItem(estimatedFreqStr));
 
-        auto* itemAccInst = new QTableWidgetItem(QString("%1%").arg(eval.accuracy, 0, 'f', 1));
-        itemAccInst->setForeground(eval.accuracy >= 60.0 ? QBrush(QColor(46, 204, 113)) : QBrush(Qt::red));
-        itemAccInst->setFont(QFont("sans", 10, QFont::Bold));
-        m_tableTargetFeatures->setItem(i, 2, itemAccInst);
+        // 第2列：当前估计方位
+        QString calcAngleStr = (eval.currentCalcAngle >= 0.0)
+            ? QString("%1°").arg(eval.currentCalcAngle, 0, 'f', 1)
+            : "--";
+        m_tableTargetFeatures->setItem(i, 2, new QTableWidgetItem(calcAngleStr));
 
-        m_tableTargetFeatures->setItem(i, 3, new QTableWidgetItem(eval.lineSpectraStrDcv));
+        // 第3列：当前估计轴频
+        QString shaftStr = eval.shaftFreq > 0.0
+            ? QString("%1 Hz").arg(eval.shaftFreq, 0, 'f', 1)
+            : "未检测到";
+        m_tableTargetFeatures->setItem(i, 3, new QTableWidgetItem(shaftStr));
 
-        auto* itemAccDcv = new QTableWidgetItem(QString("%1%").arg(eval.accuracyDcv, 0, 'f', 1));
-        itemAccDcv->setForeground(eval.accuracyDcv >= 60.0 ? QBrush(QColor(46, 204, 113)) : QBrush(Qt::red));
-        itemAccDcv->setFont(QFont("sans", 10, QFont::Bold));
-        m_tableTargetFeatures->setItem(i, 4, itemAccDcv);
+        // 第4列：当前真实线谱频率
+        m_tableTargetFeatures->setItem(i, 4, new QTableWidgetItem(eval.trueLofarFreqsStr));
 
-        QString shaftStr = eval.shaftFreq > 0 ? QString("%1 Hz").arg(eval.shaftFreq, 0, 'f', 1) : "未检测到";
-        m_tableTargetFeatures->setItem(i, 5, new QTableWidgetItem(shaftStr));
+        // 第5列：当前真实方位
+        QString trueAngleStr = eval.hasTruth
+            ? QString("%1°").arg(eval.currentTrueAngle, 0, 'f', 1)
+            : "--";
+        m_tableTargetFeatures->setItem(i, 5, new QTableWidgetItem(trueAngleStr));
 
-        QString trueAngStr = eval.hasTruth ? QString("%1° -> %2°").arg(eval.initialTrueAngle, 0, 'f', 1).arg(eval.currentTrueAngle, 0, 'f', 1) : "--";
-        m_tableTargetFeatures->setItem(i, 6, new QTableWidgetItem(trueAngStr));
+        // 第6列：当前自主筛选正确率
+        auto* itemScreeningRate = new QTableWidgetItem(
+            QString("%1%").arg(m_latestAutonomousScreeningRate, 0, 'f', 1));
+        if (m_latestAutonomousScreeningRate >= 80.0) {
+            itemScreeningRate->setForeground(QBrush(QColor(46, 204, 113)));
+        } else if (m_latestAutonomousScreeningRate >= 60.0) {
+            itemScreeningRate->setForeground(QBrush(QColor(241, 196, 15)));
+        } else {
+            itemScreeningRate->setForeground(QBrush(Qt::red));
+        }
+        QFont screeningFont = itemScreeningRate->font();
+        screeningFont.setBold(true);
+        itemScreeningRate->setFont(screeningFont);
+        m_tableTargetFeatures->setItem(i, 6, itemScreeningRate);
 
-        QString calcAngStr = eval.initialCalcAngle >= 0 ? QString("%1° -> %2°").arg(eval.initialCalcAngle, 0, 'f', 1).arg(eval.currentCalcAngle, 0, 'f', 1) : "--";
-        m_tableTargetFeatures->setItem(i, 7, new QTableWidgetItem(calcAngStr));
-
+        // 第7列：综合判定，保持原有逻辑不变
         double bestAcc = std::max(eval.accuracy, eval.accuracyDcv);
         QString judge; QColor judgeColor;
         if (bestAcc >= 80.0) { judge = "高可信"; judgeColor = QColor(46, 204, 113); }
@@ -3591,9 +3900,9 @@ void MainWindow::onEvaluationResultReady(const SystemEvaluationResult& res) {
         auto* itemJudge = new QTableWidgetItem(judge);
         itemJudge->setForeground(QBrush(judgeColor));
         QFont judgeFont = itemJudge->font(); judgeFont.setBold(true); itemJudge->setFont(judgeFont);
-        m_tableTargetFeatures->setItem(i, 8, itemJudge);
+        m_tableTargetFeatures->setItem(i, 7, itemJudge);
 
-        for(int col = 0; col < 9; ++col) {
+        for(int col = 0; col < 8; ++col) {
             if(m_tableTargetFeatures->item(i, col)) {
                 m_tableTargetFeatures->item(i, col)->setFlags(Qt::ItemIsSelectable | Qt::ItemIsEnabled);
                 m_tableTargetFeatures->item(i, col)->setTextAlignment(Qt::AlignCenter);
@@ -3665,15 +3974,21 @@ void MainWindow::onEvaluationResultReady(const SystemEvaluationResult& res) {
     // =====================================
     // 【新增下面这一行代码】：让批次正确率图表也跟随有无真值来决定是否显示
     m_plotBatchAccuracy->setVisible(anyHasTruth);
+    if (m_plotFeatureIdentifyRate) m_plotFeatureIdentifyRate->setVisible(anyHasTruth);
+    if (m_plotAutonomousScreeningRate) m_plotAutonomousScreeningRate->setVisible(anyHasTruth);
     // =====================================
 
     double avgAccInstant = validAccCount > 0 ? (totalAccInstant / validAccCount) : 0.0;
     double avgAccDcv = validAccCount > 0 ? (totalAccDcv / validAccCount) : 0.0;
-    m_lblStatAvgAcc->setText(QString("<span style='font-size:22px; color:#7f8c8d;'>瞬时 </span>"
-                                     "<span style='font-size:28px; color:#e67e22;'>%1%</span>"
-                                     "<span style='font-size:22px; color:#7f8c8d;'> | DCV </span>"
-                                     "<span style='font-size:28px; color:#27ae60;'>%2%</span>")
-                             .arg(avgAccInstant, 0, 'f', 1).arg(avgAccDcv, 0, 'f', 1));
+    // m_lblStatAvgAcc->setText(QString("<span style='font-size:22px; color:#7f8c8d;'>瞬时 </span>"
+    //                                  "<span style='font-size:28px; color:#e67e22;'>%1%</span>"
+    //                                  "<span style='font-size:22px; color:#7f8c8d;'> | DCV </span>"
+    //                                  "<span style='font-size:28px; color:#27ae60;'>%2%</span>")
+    //                          .arg(avgAccInstant, 0, 'f', 1).arg(avgAccDcv, 0, 'f', 1));
+
+    m_lblStatAvgAcc->setText(QString(
+                                     "<span style='font-size:34px; color:#27ae60;'>%1%</span>")
+                             .arg(100.0-avgAccDcv, 0, 'f', 1));
 
     QSharedPointer<QCPAxisTickerText> textTicker(new QCPAxisTickerText);
     textTicker->addTicks(ticks, labels);
@@ -3699,7 +4014,7 @@ void MainWindow::onEvaluationResultReady(const SystemEvaluationResult& res) {
     // ==========================================================
     if (res.isFinal) {
         QString finalReport = "\n=================================================================================\n";
-        finalReport += "                               高 级 航 迹 管 理 终 极 评 估 报 告                               \n";
+        finalReport += "                                航 迹 管 理 评 估 报 告                               \n";
         finalReport += "=================================================================================\n";
         finalReport += "【系统级总体评价】\n";
         finalReport += "【系统级总体评价】\n";

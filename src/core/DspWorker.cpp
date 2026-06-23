@@ -384,6 +384,16 @@ void DspWorker::run() {
             tEval.targetClass = "未知";
             tEval.isMfpCorrect = false;
 
+            if (hasTruth && !currentTruth.trueLofarFreqs.empty()) {
+                QStringList trueFreqList;
+                for (double f : currentTruth.trueLofarFreqs) {
+                    trueFreqList << QString("%1Hz").arg(f, 0, 'f', 1);
+                }
+                tEval.trueLofarFreqsStr = trueFreqList.join(", ");
+            } else {
+                tEval.trueLofarFreqsStr = "--";
+            }
+
             evalRes.targetEvals.append(tEval);
         }
 
@@ -804,6 +814,7 @@ void DspWorker::run() {
                 feature.formalId = tid;
                 feature.calAngle = last_angle;
                 feature.calDemon = shafts.empty() ? 0.0 : calculateMedian(shafts);
+                feature.activeFrames = active_frames;
 
                 std::sort(freqs.begin(), freqs.end());
                 if (!freqs.empty()) {
@@ -822,7 +833,10 @@ void DspWorker::run() {
                     if (active_frames <= 2) min_hit = 1;
 
                     for (size_t i = 0; i < final_f.size(); ++i) {
-                        if (final_c[i] >= min_hit) feature.calLofar.push_back(final_f[i]);
+                        if (final_c[i] >= min_hit) {
+                            feature.calLofar.push_back(final_f[i]);
+                            feature.calLofarCounts.push_back(std::min(final_c[i], active_frames));
+                        }
                     }
                 }
 

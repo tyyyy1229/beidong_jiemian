@@ -8,10 +8,215 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <chrono>
+#include <algorithm>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+// =========================================================================
+// 工具：互扰特征鉴别正确率计算
+// =========================================================================
+struct LineFeatureIdentifyStat {
+    int matchedHitCount = 0;        // 累计命中次数
+    int totalPossibleCount = 0;     // 理论应命中总次数 = 真实线谱数 × 有效帧数
+    int falseAlarmClusterCount = 0; // 虚警线谱簇数量
+    int falseAlarmHitCount = 0;     // 虚警累计出现次数
+    double rate = 0.0;              // 互扰特征鉴别正确率，0~100
+};
+
+static LineFeatureIdentifyStat calcLineFeatureIdentifyRate(
+    const std::vector<double>& pickedLines,
+    const std::vector<int>& pickedCounts,
+    const std::vector<double>& truthLines,
+    int activeFrames,
+    double toleranceHz = 3.5
+) {
+    LineFeatureIdentifyStat stat;
+
+    if (truthLines.empty() || activeFrames <= 0) {
+        stat.rate = 0.0;
+        return stat;
+    }
+
+    stat.totalPossibleCount =
+        static_cast<int>(truthLines.size()) * activeFrames;
+
+    std::vector<int> truthHitCounts(truthLines.size(), 0);
+
+    for (size_t i = 0; i < pickedLines.size(); ++i) {
+        double pickedF = pickedLines[i];
+
+        int count = 1;
+        if (i < pickedCounts.size()) {
+            count = pickedCounts[i];
+        }
+
+        count = std::max(0, std::min(count, activeFrames));
+
+        int bestTruthIndex = -1;
+        double bestDiff = toleranceHz;
+
+        for (int j = 0; j < static_cast<int>(truthLines.size()); ++j) {
+            double diff = std::abs(pickedF - truthLines[j]);
+
+            if (diff <= bestDiff) {
+                bestDiff = diff;
+                bestTruthIndex = j;
+            }
+        }
+
+        if (bestTruthIndex >= 0) {
+            truthHitCounts[bestTruthIndex] += count;
+        } else {
+            stat.falseAlarmClusterCount++;
+            stat.falseAlarmHitCount += count;
+        }
+    }
+
+    for (int hitCount : truthHitCounts) {
+        // 单条真实线谱在一个批次中最多应命中 activeFrames 次，
+        // 防止多个相近线谱簇重复匹配同一真实线谱导致超过100%。
+        stat.matchedHitCount += std::min(hitCount, activeFrames);
+    }
+
+    if (stat.totalPossibleCount > 0) {
+        stat.rate =
+            static_cast<double>(stat.matchedHitCount) * 100.0 /
+            stat.totalPossibleCount;
+    }
+
+    stat.rate = std::max(0.0, std::min(100.0, stat.rate));
+
+    return stat;
+}
+
+// =========================================================================
+// 工具：角度差计算（处理 0°/360° 环绕）
+// =========================================================================
+static double angleDiffDeg(double a, double b) {
+    double diff = std::fabs(a - b);
+    while (diff >= 360.0) diff -= 360.0;
+    if (diff > 180.0) diff = 360.0 - diff;
+    return diff;
+}
+
+// =========================================================================
+// 工具：自主筛选正确率 — 结构体与计算函数
+// =========================================================================
+struct NearTruthGroup {
+    std::vector<int> truthIds;
+    std::vector<double> truthAngles;
+};
+
+struct AutonomousScreeningStat {
+    int correctGroupCount = 0;
+    int totalGroupCount = 0;
+    int underScreenCount = 0;
+    int overScreenCount = 0;
+    double rate = 0.0;
+    bool hasValidGroup = false;
+};
+
+static std::vector<NearTruthGroup> buildNearTruthGroups(
+    const std::vector<TargetTruth>& truthData,
+    double gateDeg)
+{
+    std::vector<NearTruthGroup> groups;
+    int n = static_cast<int>(truthData.size());
+    if (n <= 1) return groups;
+
+    std::vector<bool> visited(n, false);
+    for (int i = 0; i < n; ++i) {
+        if (visited[i]) continue;
+
+        std::vector<int> stack;
+        std::vector<int> component;
+        stack.push_back(i);
+        visited[i] = true;
+
+        while (!stack.empty()) {
+            int u = stack.back();
+            stack.pop_back();
+            component.push_back(u);
+
+            for (int v = 0; v < n; ++v) {
+                if (visited[v]) continue;
+                double diff = angleDiffDeg(
+                    truthData[u].initialAngle,
+                    truthData[v].initialAngle);
+                if (diff <= gateDeg) {
+                    visited[v] = true;
+                    stack.push_back(v);
+                }
+            }
+        }
+
+        if (component.size() >= 2) {
+            NearTruthGroup group;
+            for (int idx : component) {
+                group.truthIds.push_back(truthData[idx].id);
+                group.truthAngles.push_back(truthData[idx].initialAngle);
+            }
+            groups.push_back(group);
+        }
+    }
+    return groups;
+}
+
+static AutonomousScreeningStat calcAutonomousScreeningAccuracy(
+    const std::vector<BatchTargetFeature>& features,
+    const std::vector<TargetTruth>& truthData,
+    double gateDeg)
+{
+    AutonomousScreeningStat stat;
+    std::vector<NearTruthGroup> groups =
+        buildNearTruthGroups(truthData, gateDeg);
+
+    stat.totalGroupCount = static_cast<int>(groups.size());
+    stat.hasValidGroup = (stat.totalGroupCount > 0);
+
+    if (!stat.hasValidGroup) {
+        stat.rate = 0.0;
+        return stat;
+    }
+
+    std::vector<bool> featureAssigned(features.size(), false);
+    for (const auto& group : groups) {
+        int trueCount = static_cast<int>(group.truthAngles.size());
+        int sysCount = 0;
+
+        for (int i = 0; i < static_cast<int>(features.size()); ++i) {
+            if (featureAssigned[i]) continue;
+
+            double bestDiff = 1e9;
+            for (double truthAngle : group.truthAngles) {
+                double diff = angleDiffDeg(features[i].calAngle, truthAngle);
+                if (diff < bestDiff) bestDiff = diff;
+            }
+
+            if (bestDiff <= gateDeg) {
+                sysCount++;
+                featureAssigned[i] = true;
+            }
+        }
+
+        if (sysCount == trueCount) {
+            stat.correctGroupCount++;
+        } else if (sysCount < trueCount) {
+            stat.underScreenCount++;
+        } else {
+            stat.overScreenCount++;
+        }
+    }
+
+    if (stat.totalGroupCount > 0) {
+        stat.rate = static_cast<double>(stat.correctGroupCount)
+                    * 100.0 / stat.totalGroupCount;
+    }
+    stat.rate = std::max(0.0, std::min(100.0, stat.rate));
+    return stat;
+}
 
 // =========================================================================
 // 1. 构造函数与初始化
@@ -75,6 +280,12 @@ void SelfValidator::loadTruthData(const QString& filePath) {
 
 void SelfValidator::setTruthData(const std::vector<TargetTruth>& manualData) {
     m_truthData = manualData;
+}
+
+void SelfValidator::setScreeningGateDeg(double gateDeg) {
+    if (gateDeg > 0.0) {
+        m_screeningGateDeg = gateDeg;
+    }
 }
 
 double SelfValidator::calculateTheoreticalAngle(int targetId, double timeSeconds) {
@@ -209,6 +420,11 @@ void SelfValidator::onBatchFinished(int batchIndex, int startFrame, int endFrame
     int correctCount = 0;
     QList<TargetEvaluation> mfpResults; // 准备发给表二的包裹
 
+    int batchMatchedHitCount = 0;
+    int batchTotalPossibleCount = 0;
+    int batchFalseAlarmClusterCount = 0;
+    int batchFalseAlarmHitCount = 0;
+
     for (const auto& feature : features) {
         TargetTruth bestTruth;
         bool foundTruth = false;
@@ -222,6 +438,27 @@ void SelfValidator::onBatchFinished(int batchIndex, int startFrame, int endFrame
         if (!foundTruth) continue;
 
         log += QString("▶ 目标 %1：%2\n").arg(feature.formalId).arg(bestTruth.name);
+
+        // --- 互扰特征鉴别正确率（单目标） ---
+        LineFeatureIdentifyStat lineStat = calcLineFeatureIdentifyRate(
+            feature.calLofar,
+            feature.calLofarCounts,
+            bestTruth.trueLofarFreqs,
+            feature.activeFrames,
+            3.5
+        );
+
+        batchMatchedHitCount += lineStat.matchedHitCount;
+        batchTotalPossibleCount += lineStat.totalPossibleCount;
+        batchFalseAlarmClusterCount += lineStat.falseAlarmClusterCount;
+        batchFalseAlarmHitCount += lineStat.falseAlarmHitCount;
+
+        log += QString("  互扰特征鉴别正确率: %1%  |  累计命中: %2/%3  |  虚警簇: %4 个  |  虚警次数: %5\n")
+                .arg(lineStat.rate, 0, 'f', 1)
+                .arg(lineStat.matchedHitCount)
+                .arg(lineStat.totalPossibleCount)
+                .arg(lineStat.falseAlarmClusterCount)
+                .arg(lineStat.falseAlarmHitCount);
 
         QString freqsStr;
         for (size_t i = 0; i < feature.calLofar.size(); ++i) freqsStr += QString::number(feature.calLofar[i], 'f', 1) + " ";
@@ -303,8 +540,50 @@ void SelfValidator::onBatchFinished(int batchIndex, int startFrame, int endFrame
         log += QString("【系统验收结论】本批次 置信度匹配正确率: %1%\n").arg(batchAccuracy, 0, 'f', 2);
     }
 
+    // --- 互扰特征鉴别正确率（批次汇总） ---
+    double batchFeatureIdentifyRate = 0.0;
+
+    if (batchTotalPossibleCount > 0) {
+        batchFeatureIdentifyRate =
+            static_cast<double>(batchMatchedHitCount) * 100.0 / batchTotalPossibleCount;
+    }
+
+    batchFeatureIdentifyRate = std::max(0.0, std::min(100.0, batchFeatureIdentifyRate));
+
+    log += QString("【系统验收结论】本批次 互扰特征鉴别正确率: %1%  |  累计命中: %2/%3  |  虚警簇: %4 个  |  虚警次数: %5\n")
+            .arg(batchFeatureIdentifyRate, 0, 'f', 2)
+            .arg(batchMatchedHitCount)
+            .arg(batchTotalPossibleCount)
+            .arg(batchFalseAlarmClusterCount)
+            .arg(batchFalseAlarmHitCount);
+
+    // --- 自主筛选正确率（近邻目标区域级指标） ---
+    AutonomousScreeningStat screeningStat =
+        calcAutonomousScreeningAccuracy(
+            features,
+            m_truthData,
+            m_screeningGateDeg);
+
+    if (!screeningStat.hasValidGroup) {
+        screeningStat.rate = 100.0;
+    }
+
+    log += QString("【系统验收结论】本批次 自主筛选正确率: %1%\n")
+            .arg(screeningStat.rate, 0, 'f', 2);
+
     emit validationLogReady(log);
+    emit autonomousScreeningAccuracyComputed(
+        batchIndex,
+        screeningStat.rate,
+        screeningStat.totalGroupCount);
     emit batchAccuracyComputed(batchIndex, batchAccuracy);
+    emit batchFeatureIdentifyRateComputed(
+        batchIndex,
+        batchFeatureIdentifyRate,
+        batchMatchedHitCount,
+        batchTotalPossibleCount,
+        batchFalseAlarmHitCount
+    );
 
     // 把完美深度的结果发送给前端！
     if (!mfpResults.isEmpty()) emit mfpResultReady(mfpResults);
